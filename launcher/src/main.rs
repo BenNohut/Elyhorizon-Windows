@@ -1069,8 +1069,14 @@ impl Launcher {
     }
 
     fn play(&mut self) {
-        let Some(tag) = self.selected().cloned() else {
-            return;
+        // Prefer a valid local/packaged engine when available; fall back to the saved selection
+        // (or normal resolution) when none is configured.
+        let tag = match backend::resolve_version(None) {
+            Ok(tag) => tag,
+            Err(_) => match self.selected().cloned() {
+                Some(tag) => tag,
+                None => return,
+            },
         };
         if self.client.is_some() || self.starting_client.is_some() {
             return;
@@ -4168,6 +4174,80 @@ fn menus() -> Vec<Menu> {
     ]
 }
 
+/// Portable Windows/package startup: when the launcher runs from a folder with a valid
+/// bundled engine beside it, default launcher/game data to folders next to the executable so a
+/// moved package works without fixed paths. Existing env overrides are never changed, and
+/// directories are created on first run. If the package folder is not writable, launcher/game
+/// homes fall back to the platform data directory (never crash). No effect on normal installs.
+fn configure_portable_paths() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(exe_dir) = exe.parent() else {
+        return;
+    };
+    let engine = exe_dir.join("engine");
+    let packaged_engine = engine.join(if cfg!(windows) {
+        "horizon-client.exe"
+    } else {
+        "horizon-client"
+    });
+    if !packaged_engine.is_file() {
+        return;
+    }
+
+    // Allow `backend::local_engine_dir()` (and the BAT/explicit cases) to find the engine even
+    // when the executable is started directly, without overriding an explicit value.
+    if std::env::var_os("HORIZON_LAUNCHER_LOCAL_ENGINE")
+        .filter(|v| !v.is_empty())
+        .is_none()
+    {
+        // SAFETY: called at process startup before worker threads are spawned.
+        unsafe { std::env::set_var("HORIZON_LAUNCHER_LOCAL_ENGINE", &engine) };
+    }
+
+    // Bundled/packaged launchers carry their own engine: do not self-replace from GitHub by
+    // default. Respect an explicit user choice.
+    if std::env::var_os("HORIZON_LAUNCHER_NO_SELF_UPDATE")
+        .filter(|v| !v.is_empty())
+        .is_none()
+    {
+        unsafe { std::env::set_var("HORIZON_LAUNCHER_NO_SELF_UPDATE", "1") };
+    }
+
+    let fallback_base = dirs::data_dir().unwrap_or_else(std::env::temp_dir);
+    let writable_package_dir = std::fs::create_dir_all(exe_dir)
+        .and_then(|_| {
+            let probe = exe_dir.join(".horizon-portable-write-check");
+            std::fs::write(&probe, b"").and_then(|_| std::fs::remove_file(probe))
+        })
+        .is_ok();
+    let base = if writable_package_dir {
+        exe_dir.to_path_buf()
+    } else {
+        fallback_base.join("horizon-launcher-portable")
+    };
+
+    if std::env::var_os("HORIZON_LAUNCHER_HOME")
+        .filter(|v| !v.is_empty())
+        .is_none()
+    {
+        let launcher_home = base.join("launcher-data");
+        if std::fs::create_dir_all(&launcher_home).is_ok() {
+            unsafe { std::env::set_var("HORIZON_LAUNCHER_HOME", &launcher_home) };
+        }
+    }
+    if std::env::var_os("HORIZON_HOME")
+        .filter(|v| !v.is_empty())
+        .is_none()
+    {
+        let game_home = base.join("game");
+        if std::fs::create_dir_all(&game_home).is_ok() {
+            unsafe { std::env::set_var("HORIZON_HOME", &game_home) };
+        }
+    }
+}
+
 fn main() {
     if let Err(error) = console::attach_for_cli() {
         eprintln!("Could not restore the launcher's terminal streams: {error}");
@@ -4175,6 +4255,7 @@ fn main() {
     }
     perf::process_started();
     backend::exe_path();
+    configure_portable_paths();
     // What the launcher downloads goes through the player's proxy, if they set one: the parts
     // that build their own agents (`horizon-port-pack`) are told before anything starts.
     horizon_launcher::proxy::announce(horizon_launcher::backend::Settings::load().proxy);

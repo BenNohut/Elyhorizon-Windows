@@ -74,6 +74,46 @@ const LAUNCHER_BINARY: &str = if cfg!(windows) {
     "horizon-launcher"
 };
 
+/// A locally built/packaged Horizon engine exposed as the `local` version. It is used
+/// instead of downloading from GitHub and is never installed as an upstream release.
+pub const LOCAL_TAG: &str = "local";
+
+fn valid_engine_dir(dir: &Path) -> bool {
+    dir.join(CLIENT).is_file()
+}
+
+/// Explicit local engine override: `HORIZON_LAUNCHER_LOCAL_ENGINE` must point at a folder
+/// that contains the game program.
+fn explicit_local_engine_dir() -> Option<PathBuf> {
+    std::env::var_os("HORIZON_LAUNCHER_LOCAL_ENGINE")
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .filter(|d| valid_engine_dir(d))
+}
+
+/// Packaged local engine beside the running launcher executable (`<exe dir>/engine`).
+fn packaged_local_engine_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.join("engine");
+    valid_engine_dir(&dir).then_some(dir)
+}
+
+/// The local engine to use, if any: explicit override first, then a valid packaged engine.
+/// Invalid/missing paths are ignored so normal installed-version behavior can continue.
+pub fn local_engine_dir() -> Option<PathBuf> {
+    explicit_local_engine_dir().or_else(packaged_local_engine_dir)
+}
+
+fn has_local_engine() -> bool {
+    local_engine_dir().is_some()
+}
+
+/// Whether the local engine comes from an explicit `HORIZON_LAUNCHER_LOCAL_ENGINE` override.
+/// Packaged engines found beside the executable do not count as explicit overrides.
+pub fn local_engine_explicitly_configured() -> bool {
+    explicit_local_engine_dir().is_some()
+}
+
 const CLIENT: &str = if cfg!(windows) {
     "horizon-client.exe"
 } else {
@@ -421,6 +461,11 @@ fn versions_dir() -> PathBuf {
 }
 
 pub fn version_dir(tag: &str) -> PathBuf {
+    if tag == LOCAL_TAG {
+        if let Some(dir) = local_engine_dir() {
+            return dir;
+        }
+    }
     versions_dir().join(tag)
 }
 
@@ -457,9 +502,14 @@ fn program_mod_api_level(path: &Path) -> u32 {
     horizon_mods::api_level::read_mark(&program).unwrap_or(0)
 }
 
-/// Installed versions, newest tag first.
+/// Installed versions, newest tag first. A valid local/packaged engine is listed first so
+/// the launcher can prefer it without hiding normally installed versions.
 pub fn installed() -> Vec<String> {
-    installed_in(&versions_dir())
+    let mut tags = installed_in(&versions_dir());
+    if has_local_engine() && !tags.iter().any(|t| t == LOCAL_TAG) {
+        tags.insert(0, LOCAL_TAG.to_string());
+    }
+    tags
 }
 
 fn installed_in(versions: &Path) -> Vec<String> {
@@ -635,7 +685,41 @@ fn game_version_at(dir: &Path) -> String {
 }
 
 pub fn resources(tag: &str) -> PathBuf {
+    if tag == LOCAL_TAG {
+        if let Some(path) = local_resources() {
+            return path;
+        }
+    }
     resources_at(&version_dir(tag))
+}
+
+/// Prepared resources for the local engine: its own `.local/horizon-client/<minecraft version>`
+/// when present and manifest-valid for that engine, else another installed version's prepared
+/// resources for the same Minecraft version with a valid manifest. Missing/invalid resources are
+/// never silently replaced with a different Minecraft version's resources.
+fn local_resources() -> Option<PathBuf> {
+    let engine_dir = local_engine_dir()?;
+    let minecraft_version = game_version_at(&engine_dir);
+    let own = engine_dir
+        .join(".local/horizon-client")
+        .join(&minecraft_version);
+    if own.join(RESOURCES_MANIFEST).is_file() {
+        return Some(own);
+    }
+    let versions = versions_dir();
+    for tag in installed_in(&versions) {
+        let dir = versions.join(&tag);
+        if game_version_at(&dir) != minecraft_version {
+            continue;
+        }
+        let candidate = resources_at(&dir);
+        if candidate.join(RESOURCES_MANIFEST).is_file() {
+            return Some(candidate);
+        }
+    }
+    // No valid prepared resources found: point at the local engine's own expected location so
+    // preparation/status checks stay deterministic and never pick a wrong-version folder.
+    Some(own)
 }
 
 fn resources_at(dir: &Path) -> PathBuf {
@@ -1871,6 +1955,9 @@ pub fn agree_eula(folder: &Path) -> Result<(), String> {
 // ----- Shared steps for the front ends -----------------------------------------------------------
 
 /// The installed version to use: the one asked for, else the selected one, else the newest.
+/// A valid local/packaged engine is the default when no explicit tag is requested, so a bundled
+/// launcher does not silently run an older installed upstream release. Explicit requests and
+/// missing/invalid local engines fall back to normal behavior.
 pub fn resolve_version(requested: Option<&str>) -> Result<String, String> {
     let installed = installed();
     if let Some(tag) = requested {
@@ -1879,6 +1966,9 @@ pub fn resolve_version(requested: Option<&str>) -> Result<String, String> {
             .find(|t| *t == tag)
             .cloned()
             .ok_or_else(|| format!("{tag} is not installed."));
+    }
+    if has_local_engine() {
+        return Ok(LOCAL_TAG.to_string());
     }
     let selected = Settings::load().selected.filter(|s| installed.contains(s));
     selected
@@ -2134,6 +2224,22 @@ pub fn select_after_update(selected: Option<&str>, installed_before: &[String]) 
 /// Installs `tag` (or with "latest" the newest release, pre-releases left out), then updates the selection as
 /// `select_after_update` says when `as_update`, or always selects it otherwise.
 pub fn install_tag(tag: &str, as_update: bool, progress: impl Fn(f32)) -> Result<String, String> {
+    // A local engine is already present on disk: never download it from GitHub.
+    if tag == LOCAL_TAG {
+        if !has_local_engine() {
+            return Err(format!(
+                "{LOCAL_TAG} engine is not configured or is missing its program."
+            ));
+        }
+        progress(1.0);
+        let before = installed_in(&versions_dir());
+        let mut settings = Settings::load();
+        if !as_update || select_after_update(settings.selected.as_deref(), &before) {
+            settings.selected = Some(LOCAL_TAG.to_string());
+            settings.save();
+        }
+        return Ok(LOCAL_TAG.to_string());
+    }
     let releases = releases()?;
     let release = if tag == "latest" {
         releases

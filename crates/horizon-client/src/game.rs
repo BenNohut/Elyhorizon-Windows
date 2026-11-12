@@ -330,15 +330,18 @@ struct Options {
     execution_role: execution_role::ExecutionRole,
 }
 impl Options {
-    /// The name to join servers with: the one given, else the offline name kept
-    /// next to options.txt (created on first use).
+    /// The name to join servers with: the explicit one, then the signed-in session's name,
+    /// else the offline name kept next to options.txt (created on first use).
     fn player_name(&self) -> String {
-        self.player_name.clone().unwrap_or_else(|| {
-            std::env::current_dir().map_or_else(
-                |_| horizon_client::offline_name::generate(0),
-                |dir| horizon_client::offline_name::load_or_create(&dir),
-            )
-        })
+        self.player_name
+            .clone()
+            .or_else(|| horizon_client::auth::current().map(|a| a.name.clone()))
+            .unwrap_or_else(|| {
+                std::env::current_dir().map_or_else(
+                    |_| horizon_client::offline_name::generate(0),
+                    |dir| horizon_client::offline_name::load_or_create(&dir),
+                )
+            })
     }
     fn read() -> Result<Option<Self>> {
         let sibling = std::env::current_exe()?
@@ -491,10 +494,14 @@ impl Options {
         if let Some(path) = session_file.filter(|p| !p.is_empty()) {
             match horizon_client::auth::AuthSession::load(path.as_ref()) {
                 Ok(session) => {
+                    log::info!("session file loaded");
                     o.player_name = Some(session.name.clone());
                     horizon_client::auth::set_current(session);
                 }
-                Err(e) => eprintln!("Horizon: not signed in: {e}"),
+                Err(e) => {
+                    log::warn!("session file load failed: {e}");
+                    eprintln!("Horizon: not signed in: {e}");
+                }
             }
         }
         Ok(Some(o))
